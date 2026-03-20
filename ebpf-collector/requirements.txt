@@ -1,0 +1,5 @@
+bcc==0.29.1
+kafka-python==2.0.2
+psutil==5.9.8
+structlog==24.1.0
+click==8.1.7

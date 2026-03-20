@@ -1,0 +1,340 @@
+openapi: 3.0.3
+info:
+  title: eBPF Runtime Anomaly Detection Platform API
+  description: |
+    Production-grade REST API for querying runtime anomaly detection results,
+    container behavioral profiles, and platform health status.
+    
+    The platform uses eBPF telemetry and Isolation Forest ML models to detect
+    anomalous behavior in containerized workloads in real-time.
+  version: 1.0.0
+  contact:
+    name: Dhananjay Patil
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:8083/api/v1
+    description: Local Development
+
+tags:
+  - name: Anomaly Detection
+    description: Query and manage detected anomalies
+  - name: Container Profiles
+    description: Container behavioral fingerprints and baselines
+  - name: Health
+    description: Platform health and readiness
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Platform health check
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Health status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /anomalies:
+    get:
+      tags: [Anomaly Detection]
+      summary: List detected anomalies
+      operationId: listAnomalies
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: severity
+          in: query
+          schema:
+            type: string
+            enum: [LOW, MEDIUM, HIGH, CRITICAL]
+        - name: containerId
+          in: query
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Paginated list of anomalies
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PagedAnomalyResponse'
+
+  /anomalies/{resultId}:
+    get:
+      tags: [Anomaly Detection]
+      summary: Get anomaly detail
+      operationId: getAnomaly
+      parameters:
+        - name: resultId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Anomaly detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnomalyResponse'
+        '404':
+          description: Not found
+
+  /anomalies/stats:
+    get:
+      tags: [Anomaly Detection]
+      summary: Get anomaly statistics
+      operationId: getAnomalyStats
+      parameters:
+        - name: hours
+          in: query
+          schema:
+            type: integer
+            default: 24
+      responses:
+        '200':
+          description: Anomaly statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnomalyStats'
+
+  /containers:
+    get:
+      tags: [Container Profiles]
+      summary: List monitored containers
+      operationId: listContainers
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: riskLevel
+          in: query
+          schema:
+            type: string
+            enum: [LOW, MEDIUM, HIGH, CRITICAL]
+      responses:
+        '200':
+          description: Paginated container list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PagedContainerResponse'
+
+  /containers/{containerId}/profile:
+    get:
+      tags: [Container Profiles]
+      summary: Get container behavioral profile
+      operationId: getContainerProfile
+      parameters:
+        - name: containerId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Container profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContainerProfile'
+        '404':
+          description: Not found
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [UP, DEGRADED, DOWN]
+        timestamp:
+          type: string
+          format: date-time
+        database:
+          type: object
+          properties:
+            status:
+              type: string
+            type:
+              type: string
+        kafka:
+          type: object
+          properties:
+            status:
+              type: string
+
+    AnomalyResponse:
+      type: object
+      properties:
+        result_id:
+          type: string
+        container_id:
+          type: string
+        anomaly_score:
+          type: number
+          format: double
+        is_anomalous:
+          type: boolean
+        severity:
+          type: string
+          enum: [LOW, MEDIUM, HIGH, CRITICAL]
+        description:
+          type: string
+        detected_at:
+          type: string
+          format: date-time
+        window_start:
+          type: string
+          format: date-time
+        window_end:
+          type: string
+          format: date-time
+        contributing_features:
+          type: array
+          items:
+            type: string
+        model_version:
+          type: string
+
+    PagedAnomalyResponse:
+      type: object
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnomalyResponse'
+        page:
+          type: integer
+        size:
+          type: integer
+        total_elements:
+          type: integer
+          format: int64
+        total_pages:
+          type: integer
+        has_next:
+          type: boolean
+
+    AnomalyStats:
+      type: object
+      properties:
+        total_anomalies:
+          type: integer
+          format: int64
+        total_scored:
+          type: integer
+          format: int64
+        avg_anomaly_score:
+          type: number
+          format: double
+        critical_count:
+          type: integer
+          format: int64
+        high_count:
+          type: integer
+          format: int64
+        affected_containers:
+          type: integer
+          format: int64
+        since:
+          type: string
+          format: date-time
+        generated_at:
+          type: string
+          format: date-time
+
+    ContainerProfile:
+      type: object
+      properties:
+        container_id:
+          type: string
+        container_name:
+          type: string
+        image_name:
+          type: string
+        namespace:
+          type: string
+        first_seen:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+        total_events:
+          type: integer
+          format: int64
+        total_anomalies:
+          type: integer
+          format: int64
+        anomaly_rate:
+          type: number
+          format: double
+        avg_anomaly_score:
+          type: number
+          format: double
+        max_anomaly_score:
+          type: number
+          format: double
+        baseline_process_list:
+          type: array
+          items:
+            type: string
+        baseline_network_destinations:
+          type: array
+          items:
+            type: string
+        risk_level:
+          type: string
+          enum: [LOW, MEDIUM, HIGH, CRITICAL]
+
+    PagedContainerResponse:
+      type: object
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContainerProfile'
+        page:
+          type: integer
+        size:
+          type: integer
+        total_elements:
+          type: integer
+          format: int64
+        total_pages:
+          type: integer
+        has_next:
+          type: boolean

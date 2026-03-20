@@ -1,0 +1,196 @@
+version: "3.8"
+
+# ============================================================================
+# eBPF Runtime Anomaly Platform - Infrastructure Stack
+# Run with: podman-compose -f infra/podman-compose.yaml up -d
+# ============================================================================
+
+services:
+
+  # --------------------------------------------------------------------------
+  # Zookeeper (Kafka dependency)
+  # --------------------------------------------------------------------------
+  zookeeper:
+    image: docker.io/confluentinc/cp-zookeeper:7.6.0
+    container_name: rap-zookeeper
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_INIT_LIMIT: 5
+      ZOOKEEPER_SYNC_LIMIT: 2
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Apache Kafka
+  # --------------------------------------------------------------------------
+  kafka:
+    image: docker.io/confluentinc/cp-kafka:7.6.0
+    container_name: rap-kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 12
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_JMX_PORT: 9093
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Kafka Topic Initialization
+  # --------------------------------------------------------------------------
+  kafka-init:
+    image: docker.io/confluentinc/cp-kafka:7.6.0
+    container_name: rap-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      echo 'Creating Kafka topics...'
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic runtime-events --partitions 12 --replication-factor 1 --config retention.ms=604800000
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic runtime-events.DLT --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic processed-events --partitions 12 --replication-factor 1 --config retention.ms=604800000
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic processed-events.DLT --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic feature-vectors --partitions 6 --replication-factor 1 --config retention.ms=259200000
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic feature-vectors.DLT --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic anomaly-results --partitions 6 --replication-factor 1 --config retention.ms=1209600000
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic anomaly-results.DLT --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+      echo 'Topics created:'
+      kafka-topics --list --bootstrap-server kafka:29092
+      "
+
+  # --------------------------------------------------------------------------
+  # Oracle XE Database
+  # --------------------------------------------------------------------------
+  oracle-xe:
+    image: docker.io/gvenzl/oracle-xe:21-slim
+    container_name: rap-oracle-xe
+    hostname: oracle-xe
+    ports:
+      - "1521:1521"
+    environment:
+      ORACLE_PASSWORD: oracle_root_pw
+      APP_USER: rap_user
+      APP_USER_PASSWORD: rap_password
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+      - ./oracle/init:/container-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # eBPF Collector (Simulation Mode)
+  # --------------------------------------------------------------------------
+  ebpf-collector:
+    build:
+      context: ../ebpf-collector
+      dockerfile: Dockerfile
+    container_name: rap-ebpf-collector
+    hostname: ebpf-collector
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    command: ["--kafka-servers", "kafka:29092", "--mode", "simulate", "--eps", "50", "--anomaly-rate", "0.05"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # ML Service
+  # --------------------------------------------------------------------------
+  ml-service:
+    build:
+      context: ../ml-service
+      dockerfile: Dockerfile
+    container_name: rap-ml-service
+    hostname: ml-service
+    ports:
+      - "8084:8084"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      FEATURE_VECTORS_TOPIC: feature-vectors
+      ANOMALY_RESULTS_TOPIC: anomaly-results
+      CONSUMER_GROUP: ml-group
+      MODEL_DIR: /app/models
+      RETRAIN_INTERVAL_HOURS: 1
+      CONTAMINATION: "0.05"
+      MIN_TRAINING_SAMPLES: 50
+      FLASK_PORT: 8084
+    volumes:
+      - ml-models:/app/models
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8084/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Kafka UI (Monitoring)
+  # --------------------------------------------------------------------------
+  kafka-ui:
+    image: docker.io/provectuslabs/kafka-ui:latest
+    container_name: rap-kafka-ui
+    ports:
+      - "9080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: rap-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  oracle-data:
+  ml-models:

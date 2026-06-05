@@ -5,6 +5,7 @@ import com.dhananjay.rap.common.constants.SyscallCategory;
 import com.dhananjay.rap.common.event.ProcessedEvent;
 import com.dhananjay.rap.common.event.RuntimeEvent;
 import com.dhananjay.rap.common.util.JsonUtil;
+import com.dhananjay.rap.ingestion.repository.ProcessedEventRepository;
 import com.dhananjay.rap.ingestion.repository.RuntimeEventRepository;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.RequiredArgsConstructor;
@@ -23,6 +24,7 @@ import java.util.UUID;
 public class EventProcessingService {
 
     private final RuntimeEventRepository runtimeEventRepository;
+    private final ProcessedEventRepository processedEventRepository;
     private final KafkaTemplate<String, String> kafkaTemplate;
 
     private static final Set<String> NETWORK_SYSCALLS = Set.of(
@@ -47,6 +49,7 @@ public class EventProcessingService {
         runtimeEventRepository.insertRuntimeEvent(rawEvent);
 
         ProcessedEvent processedEvent = enrichEvent(rawEvent);
+        processedEventRepository.upsertProcessedEvent(processedEvent);
 
         String json = JsonUtil.toJson(processedEvent);
         kafkaTemplate.send(KafkaTopics.PROCESSED_EVENTS, processedEvent.getContainerId(), json)

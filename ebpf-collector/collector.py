@@ -12,12 +12,14 @@ Must run as root (CAP_SYS_ADMIN).
 
 import json
 import os
+import re
 import signal
 import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from functools import lru_cache
+from typing import Optional, Tuple
 
 import click
 import structlog
@@ -153,31 +155,90 @@ SYSCALL_NAMES = {
 
 
 # ============================================================================
-# Container ID Resolution
+# Container ID Resolution (P3.5)
 # ============================================================================
 
-def resolve_container_id(pid: int) -> Optional[str]:
-    """Resolve container ID from /proc/<pid>/cgroup."""
+_HEX_RE = re.compile(r'^[0-9a-f]{64}$')
+
+
+def _extract_container_id_from_cgroup_line(line: str) -> Optional[str]:
+    """Extract 12-char container ID from a single cgroup entry line."""
+    # cgroupv1: hierarchy_id:subsystem:path
+    # cgroupv2: 0::/path
+    path = line.strip().split(":", 2)[-1] if ":" in line else line.strip()
+    parts = path.split("/")
+    for part in reversed(parts):
+        part = part.rstrip()
+        # Docker: 64-char hex ID (may appear directly)
+        if _HEX_RE.match(part):
+            return part[:12]
+        # cgroupv2 docker: docker-<64hex>.scope
+        m = re.match(r'^docker-([0-9a-f]{64})\.scope$', part)
+        if m:
+            return m.group(1)[:12]
+        # containerd / CRI-O: cri-containerd-<64hex>.scope or crio-<64hex>.scope
+        m = re.match(r'^(?:cri-containerd|crio)-([0-9a-f]{64})\.scope$', part)
+        if m:
+            return m.group(1)[:12]
+        # Podman / libpod: libpod-<64hex>.scope or libpod_<64hex>
+        m = re.match(r'^libpod[-_]([0-9a-f]{64})(?:\.scope)?$', part)
+        if m:
+            return m.group(1)[:12]
+        # containerd sandboxed: contains 64-hex substring
+        hex_match = re.search(r'([0-9a-f]{64})', part)
+        if hex_match:
+            return hex_match.group(1)[:12]
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _resolve_container_id_cached(pid: int) -> Optional[str]:
+    """Cached resolution: avoids repeated /proc reads for the same PID."""
     try:
-        cgroup_path = f"/proc/{pid}/cgroup"
-        if not os.path.exists(cgroup_path):
-            return None
-        with open(cgroup_path, "r") as f:
+        with open(f"/proc/{pid}/cgroup", "r") as f:
             for line in f:
-                parts = line.strip().split("/")
-                for part in reversed(parts):
-                    # Docker/Podman container IDs are 64-char hex strings
-                    if len(part) == 64 and all(c in "0123456789abcdef" for c in part):
-                        return part[:12]
-                    # containerd format: cri-containerd-<id>.scope
-                    if part.startswith("cri-containerd-"):
-                        return part.replace("cri-containerd-", "").replace(".scope", "")[:12]
-                    # Podman format
-                    if part.startswith("libpod-"):
-                        return part.replace("libpod-", "").replace(".scope", "")[:12]
-    except (FileNotFoundError, PermissionError):
+                cid = _extract_container_id_from_cgroup_line(line)
+                if cid:
+                    return cid
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
         pass
     return None
+
+
+def resolve_container_id(pid: int) -> Optional[str]:
+    """Resolve container ID from /proc/<pid>/cgroup with LRU cache."""
+    return _resolve_container_id_cached(pid)
+
+
+def resolve_container_meta(pid: int) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Resolve (container_id, image_name, namespace) for a PID.
+    Reads /proc/<pid>/environ for HOSTNAME (container short ID),
+    and falls back to cgroup resolution.
+    Returns (container_id, image_name, namespace).
+    """
+    container_id = resolve_container_id(pid)
+    image_name = None
+    namespace = None
+
+    if container_id is None:
+        return None, None, None
+
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            env_data = f.read(65536)  # cap at 64KB
+        env_vars = {}
+        for kv in env_data.split(b'\x00'):
+            if b'=' in kv:
+                k, _, v = kv.partition(b'=')
+                env_vars[k.decode("utf-8", errors="replace")] = v.decode("utf-8", errors="replace")
+        image_name = env_vars.get("IMAGE_NAME") or env_vars.get("CONTAINER_IMAGE")
+        namespace = (env_vars.get("NAMESPACE") or env_vars.get("POD_NAMESPACE")
+                     or env_vars.get("K8S_NAMESPACE"))
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        pass
+
+    return container_id, image_name, namespace
 
 
 def int_to_ip(addr: int) -> str:
@@ -285,7 +346,7 @@ class EbpfCollector:
         """Process a syscall event from the eBPF perf buffer."""
         event = self.bpf_syscall["syscall_events"].event(data)
 
-        container_id = resolve_container_id(event.pid)
+        container_id, image_name, namespace = resolve_container_meta(event.pid)
         if self.filter_containers_only and not container_id:
             return
 
@@ -295,6 +356,8 @@ class EbpfCollector:
             "event_id": str(uuid.uuid4()),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "container_id": container_id or "host",
+            "image_name": image_name,
+            "namespace": namespace,
             "pid": event.pid,
             "ppid": event.ppid,
             "syscall": syscall_name,
@@ -313,7 +376,7 @@ class EbpfCollector:
         """Process a network event from the eBPF perf buffer."""
         event = self.bpf_network["net_events"].event(data)
 
-        container_id = resolve_container_id(event.pid)
+        container_id, image_name, namespace = resolve_container_meta(event.pid)
         if self.filter_containers_only and not container_id:
             return
 
@@ -321,6 +384,8 @@ class EbpfCollector:
             "event_id": str(uuid.uuid4()),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "container_id": container_id or "host",
+            "image_name": image_name,
+            "namespace": namespace,
             "pid": event.pid,
             "syscall": "connect",
             "process_name": event.comm.decode("utf-8", errors="replace"),

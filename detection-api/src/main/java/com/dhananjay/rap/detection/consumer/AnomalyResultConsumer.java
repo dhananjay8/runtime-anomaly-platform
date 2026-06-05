@@ -4,6 +4,8 @@ import com.dhananjay.rap.common.constants.KafkaTopics;
 import com.dhananjay.rap.common.event.AnomalyResult;
 import com.dhananjay.rap.common.util.JsonUtil;
 import com.dhananjay.rap.detection.repository.AnomalyRepository;
+import com.dhananjay.rap.detection.service.AlertService;
+import com.dhananjay.rap.detection.service.ProfileAggregationService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -18,6 +20,8 @@ import java.util.List;
 public class AnomalyResultConsumer {
 
     private final AnomalyRepository anomalyRepository;
+    private final ProfileAggregationService profileAggregationService;
+    private final AlertService alertService;
 
     @KafkaListener(
             topics = KafkaTopics.ANOMALY_RESULTS,
@@ -45,9 +49,12 @@ public class AnomalyResultConsumer {
                         result.getWindowEnd()
                 );
 
+                profileAggregationService.updateProfile(result);
+
                 if (Boolean.TRUE.equals(result.getIsAnomalous())) {
                     log.warn("ANOMALY DETECTED: container={} score={} severity={}",
                             result.getContainerId(), result.getAnomalyScore(), result.getSeverity());
+                    alertService.evaluateAndAlert(result);
                 }
             } catch (Exception e) {
                 log.error("Failed to persist anomaly result from partition={} offset={}: {}",

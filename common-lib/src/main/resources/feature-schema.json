@@ -1,0 +1,27 @@
+{
+  "version": "1.0",
+  "feature_names": [
+    "syscall_read_freq",
+    "syscall_write_freq",
+    "syscall_open_freq",
+    "syscall_close_freq",
+    "syscall_exec_freq",
+    "syscall_connect_freq",
+    "syscall_accept_freq",
+    "syscall_mmap_freq",
+    "unique_process_count",
+    "unique_syscall_count",
+    "process_creation_rate",
+    "unique_dest_ips",
+    "unique_dest_ports",
+    "network_event_ratio",
+    "syscall_entropy",
+    "process_entropy",
+    "privileged_event_ratio",
+    "uid_zero_ratio"
+  ],
+  "tracked_syscalls": [
+    "read", "write", "open", "close", "execve", "connect", "accept", "mmap"
+  ],
+  "feature_count": 18
+}

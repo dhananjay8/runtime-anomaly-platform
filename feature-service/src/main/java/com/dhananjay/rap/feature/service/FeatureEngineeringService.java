@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -33,39 +34,58 @@ public class FeatureEngineeringService {
     @Value("${feature.window.max-events:10000}")
     private int maxEventsPerWindow;
 
+    @Value("${feature.window.allowed-lateness-seconds:10}")
+    private int allowedLatenessSeconds;
+
+    // Key: "containerId|windowStartEpochSeconds"
     private final ConcurrentHashMap<String, WindowAccumulator> activeWindows = new ConcurrentHashMap<>();
 
+    private Instant computeEventTimeBucket(Instant eventTime) {
+        long epochSeconds = eventTime.getEpochSecond();
+        long bucketStart = (epochSeconds / windowDurationSeconds) * windowDurationSeconds;
+        return Instant.ofEpochSecond(bucketStart);
+    }
+
+    private String windowKey(String containerId, Instant bucketStart) {
+        return containerId + "|" + bucketStart.getEpochSecond();
+    }
+
     public void accumulateEvent(ProcessedEvent event) {
-        String containerId = event.getContainerId();
-        WindowAccumulator window = activeWindows.computeIfAbsent(containerId,
-                k -> new WindowAccumulator(containerId, Instant.now(), windowDurationSeconds));
+        Instant eventTime = event.getTimestamp() != null ? event.getTimestamp() : Instant.now();
+        Instant bucketStart = computeEventTimeBucket(eventTime);
+        String key = windowKey(event.getContainerId(), bucketStart);
+
+        WindowAccumulator window = activeWindows.computeIfAbsent(key,
+                k -> new WindowAccumulator(event.getContainerId(), bucketStart, windowDurationSeconds));
 
         window.addEvent(event);
 
         if (window.getEventCount() >= maxEventsPerWindow) {
-            flushWindow(containerId, window);
+            WindowAccumulator flushed = activeWindows.remove(key);
+            if (flushed != null) {
+                flushWindow(event.getContainerId(), flushed);
+            }
         }
     }
 
     public void flushExpiredWindows() {
         Instant now = Instant.now();
-        List<String> expired = new ArrayList<>();
+        Instant watermark = now.minusSeconds(allowedLatenessSeconds);
 
-        activeWindows.forEach((containerId, window) -> {
-            if (window.isExpired(now)) {
-                expired.add(containerId);
-            }
-        });
+        List<String> expiredKeys = activeWindows.entrySet().stream()
+                .filter(e -> e.getValue().isPastAllowedLateness(watermark))
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
 
-        for (String containerId : expired) {
-            WindowAccumulator window = activeWindows.remove(containerId);
+        for (String key : expiredKeys) {
+            WindowAccumulator window = activeWindows.remove(key);
             if (window != null && window.getEventCount() > 0) {
-                flushWindow(containerId, window);
+                flushWindow(window.getContainerId(), window);
             }
         }
 
-        if (!expired.isEmpty()) {
-            log.info("Flushed {} expired windows", expired.size());
+        if (!expiredKeys.isEmpty()) {
+            log.info("Flushed {} expired event-time windows", expiredKeys.size());
         }
     }
 
@@ -125,6 +145,10 @@ public class FeatureEngineeringService {
             return Collections.unmodifiableList(events);
         }
 
+        public String getContainerId() {
+            return containerId;
+        }
+
         public Instant getWindowStart() {
             return windowStart;
         }
@@ -133,8 +157,8 @@ public class FeatureEngineeringService {
             return windowStart.plus(Duration.ofSeconds(durationSeconds));
         }
 
-        public boolean isExpired(Instant now) {
-            return now.isAfter(getWindowEnd());
+        public boolean isPastAllowedLateness(Instant watermark) {
+            return watermark.isAfter(getWindowEnd());
         }
     }
 }

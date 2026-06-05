@@ -1,5 +1,6 @@
 package com.dhananjay.rap.feature.engine;
 
+import com.dhananjay.rap.common.constants.FeatureSchema;
 import com.dhananjay.rap.common.event.FeatureVector;
 import com.dhananjay.rap.common.event.ProcessedEvent;
 import lombok.extern.slf4j.Slf4j;
@@ -13,19 +14,8 @@ import java.util.stream.Collectors;
 @Component
 public class FeatureExtractor {
 
-    private static final String[] TRACKED_SYSCALLS = {
-            "read", "write", "open", "close", "execve", "connect", "accept", "mmap"
-    };
-
-    private static final String[] FEATURE_NAMES = {
-            "syscall_read_freq", "syscall_write_freq", "syscall_open_freq",
-            "syscall_close_freq", "syscall_exec_freq", "syscall_connect_freq",
-            "syscall_accept_freq", "syscall_mmap_freq",
-            "unique_process_count", "unique_syscall_count", "process_creation_rate",
-            "unique_dest_ips", "unique_dest_ports", "network_event_ratio",
-            "syscall_entropy", "process_entropy",
-            "privileged_event_ratio", "uid_zero_ratio"
-    };
+    private static final String[] TRACKED_SYSCALLS = FeatureSchema.TRACKED_SYSCALLS;
+    private static final String[] FEATURE_NAMES = FeatureSchema.FEATURE_NAMES;
 
     public FeatureVector extract(String containerId, List<ProcessedEvent> events,
                                   Instant windowStart, Instant windowEnd) {

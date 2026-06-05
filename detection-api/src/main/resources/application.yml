@@ -5,9 +5,9 @@ spring:
   application:
     name: detection-api
   datasource:
-    url: jdbc:oracle:thin:@localhost:1521/XEPDB1
-    username: rap_user
-    password: rap_password
+    url: ${DB_URL:jdbc:oracle:thin:@localhost:1521/XEPDB1}
+    username: ${DB_USERNAME:rap_user}
+    password: ${DB_PASSWORD:rap_password}
     driver-class-name: oracle.jdbc.OracleDriver
     hikari:
       maximum-pool-size: 20
@@ -15,7 +15,11 @@ spring:
       idle-timeout: 300000
       connection-timeout: 20000
   kafka:
-    bootstrap-servers: localhost:9092
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
+rap:
+  alerting:
+    webhook-url: ${RAP_ALERT_WEBHOOK_URL:}
 
 springdoc:
   api-docs:

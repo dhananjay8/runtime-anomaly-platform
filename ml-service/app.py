@@ -19,7 +19,9 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import joblib
@@ -53,16 +55,33 @@ THRESHOLD_MEDIUM = 0.6
 THRESHOLD_HIGH = 0.75
 THRESHOLD_CRITICAL = 0.9
 
-# Feature names (must match FeatureExtractor.java output)
-FEATURE_NAMES = [
-    "syscall_read_freq", "syscall_write_freq", "syscall_open_freq",
-    "syscall_close_freq", "syscall_exec_freq", "syscall_connect_freq",
-    "syscall_accept_freq", "syscall_mmap_freq",
-    "unique_process_count", "unique_syscall_count", "process_creation_rate",
-    "unique_dest_ips", "unique_dest_ports", "network_event_ratio",
-    "syscall_entropy", "process_entropy",
-    "privileged_event_ratio", "uid_zero_ratio"
-]
+# Feature names — loaded from shared feature-schema.json (single source of truth)
+def _load_feature_schema() -> dict:
+    schema_paths = [
+        Path(os.getenv("FEATURE_SCHEMA_PATH", "/app/feature-schema.json")),
+        Path(__file__).parent / "feature-schema.json",
+    ]
+    for p in schema_paths:
+        if p.exists():
+            with open(p) as f:
+                return json.load(f)
+    logger.warning("feature-schema.json not found, using hardcoded fallback")
+    return {
+        "version": "1.0",
+        "feature_names": [
+            "syscall_read_freq", "syscall_write_freq", "syscall_open_freq",
+            "syscall_close_freq", "syscall_exec_freq", "syscall_connect_freq",
+            "syscall_accept_freq", "syscall_mmap_freq",
+            "unique_process_count", "unique_syscall_count", "process_creation_rate",
+            "unique_dest_ips", "unique_dest_ports", "network_event_ratio",
+            "syscall_entropy", "process_entropy",
+            "privileged_event_ratio", "uid_zero_ratio"
+        ],
+    }
+
+_FEATURE_SCHEMA = _load_feature_schema()
+FEATURE_NAMES = _FEATURE_SCHEMA["feature_names"]
+SCHEMA_VERSION = _FEATURE_SCHEMA.get("version", "unknown")
 
 # ============================================================================
 # Prometheus Metrics
@@ -74,6 +93,8 @@ SCORING_LATENCY = Histogram("ml_scoring_latency_seconds", "Time to score a featu
 MODEL_VERSION = Gauge("ml_model_version_timestamp", "Timestamp of current model version")
 TRAINING_SAMPLES = Gauge("ml_training_samples_count", "Number of samples used in last training")
 BUFFER_SIZE = Gauge("ml_training_buffer_size", "Current size of training data buffer")
+DRIFT_SCORE = Gauge("ml_drift_score", "Current feature drift score vs baseline")
+MODEL_REGISTRY_SIZE = Gauge("ml_model_registry_size", "Number of models in registry")
 
 
 # ============================================================================
@@ -94,14 +115,25 @@ class AnomalyDetector:
         self.training_buffer: list = []
         self.max_buffer_size = 50000
         self._lock = threading.Lock()
+        self._retrain_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="retrain")
+        self._retrain_future = None
+
+        # P2.3: per-image baseline means/stds for z-score explanations
+        self._image_baselines: dict = {}  # image_name -> {"mean": np.ndarray, "std": np.ndarray, "count": int}
+
+        # P2.4: model registry (version -> metadata)
+        self._model_registry: dict = {}
+        self._baseline_mean: Optional[np.ndarray] = None
+        self._baseline_std: Optional[np.ndarray] = None
 
         os.makedirs(MODEL_DIR, exist_ok=True)
         self._load_latest_model()
+        self._load_model_registry()
 
     def _load_latest_model(self):
         """Load the most recent persisted model if available."""
         try:
-            model_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".joblib")]
+            model_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".joblib") and f.startswith("model_")]
             if model_files:
                 latest = sorted(model_files)[-1]
                 path = os.path.join(MODEL_DIR, latest)
@@ -111,6 +143,65 @@ class AnomalyDetector:
                 logger.info("Loaded model", version=self.model_version, path=path)
         except Exception as e:
             logger.warning("No existing model found", error=str(e))
+
+    def _load_model_registry(self):
+        """P2.4: Build registry from persisted model files."""
+        registry_path = os.path.join(MODEL_DIR, "registry.json")
+        if os.path.exists(registry_path):
+            try:
+                with open(registry_path) as f:
+                    self._model_registry = json.load(f)
+            except Exception as e:
+                logger.warning("Failed to load model registry", error=str(e))
+        MODEL_REGISTRY_SIZE.set(len(self._model_registry))
+
+    def _save_model_registry(self):
+        registry_path = os.path.join(MODEL_DIR, "registry.json")
+        try:
+            with open(registry_path, "w") as f:
+                json.dump(self._model_registry, f, indent=2, default=str)
+        except Exception as e:
+            logger.warning("Failed to save model registry", error=str(e))
+
+    def replay_training_buffer(self, feature_rows: list):
+        """P2.3: Seed training buffer from persisted feature_vectors on startup."""
+        loaded = 0
+        for row in feature_rows:
+            try:
+                vec = np.array(row, dtype=np.float64)
+                if len(vec) == len(FEATURE_NAMES):
+                    self.training_buffer.append(vec)
+                    loaded += 1
+            except Exception:
+                pass
+        if loaded > 0:
+            BUFFER_SIZE.set(len(self.training_buffer))
+            logger.info("Replayed training buffer from DB", samples=loaded)
+
+    def update_image_baseline(self, image_name: str, features: np.ndarray):
+        """P2.3: Online update of per-image running mean/std (Welford's algorithm)."""
+        if not image_name:
+            return
+        if image_name not in self._image_baselines:
+            self._image_baselines[image_name] = {
+                "mean": features.copy(), "M2": np.zeros_like(features), "count": 1
+            }
+            return
+        b = self._image_baselines[image_name]
+        b["count"] += 1
+        delta = features - b["mean"]
+        b["mean"] += delta / b["count"]
+        delta2 = features - b["mean"]
+        b["M2"] += delta * delta2
+
+    def _get_image_std(self, image_name: str) -> Optional[np.ndarray]:
+        if image_name not in self._image_baselines:
+            return None
+        b = self._image_baselines[image_name]
+        if b["count"] < 2:
+            return None
+        variance = b["M2"] / (b["count"] - 1)
+        return np.sqrt(np.maximum(variance, 1e-8))
 
     def add_training_sample(self, features: np.ndarray):
         """Add a feature vector to the training buffer."""
@@ -133,7 +224,6 @@ class AnomalyDetector:
 
         logger.info("Training Isolation Forest", samples=X.shape[0], features=X.shape[1])
 
-        # Replace NaN/Inf with 0
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
         model = IsolationForest(
@@ -151,15 +241,57 @@ class AnomalyDetector:
         model_path = os.path.join(MODEL_DIR, f"model_{version}.joblib")
         joblib.dump(model, model_path)
 
+        # P2.2: compute and store global baseline mean/std for z-score explanations
+        self._baseline_mean = X.mean(axis=0)
+        self._baseline_std = np.maximum(X.std(axis=0), 1e-8)
+
+        # P2.4: compute drift score vs previous baseline
+        drift = self._compute_drift(X)
+        DRIFT_SCORE.set(drift)
+
+        # P2.4: register model metadata
+        meta = {
+            "version": version,
+            "path": model_path,
+            "samples": int(X.shape[0]),
+            "features": int(X.shape[1]),
+            "schema_version": SCHEMA_VERSION,
+            "drift_score": round(drift, 6),
+            "trained_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._model_registry[version] = meta
+        self._save_model_registry()
+        MODEL_REGISTRY_SIZE.set(len(self._model_registry))
+
         self.model = model
         self.model_version = version
         MODEL_VERSION.set(float(version))
         TRAINING_SAMPLES.set(X.shape[0])
 
-        logger.info("Model trained and saved", version=version, path=model_path, samples=X.shape[0])
+        logger.info("Model trained and saved", version=version, path=model_path,
+                    samples=X.shape[0], drift=drift)
         return True
 
-    def score(self, features: np.ndarray) -> dict:
+    def train_async(self):
+        """P2.7: Submit training to background thread pool (non-blocking)."""
+        if self._retrain_future is not None and not self._retrain_future.done():
+            logger.info("Retrain already in progress, skipping")
+            return
+        self._retrain_future = self._retrain_executor.submit(self.train)
+        logger.info("Async retrain submitted")
+
+    def _compute_drift(self, X: np.ndarray) -> float:
+        """P2.4: Mean absolute deviation of new training data mean vs baseline mean."""
+        if self._baseline_mean is None:
+            return 0.0
+        new_mean = X.mean(axis=0)
+        if self._baseline_std is not None:
+            normalized = np.abs(new_mean - self._baseline_mean) / self._baseline_std
+        else:
+            normalized = np.abs(new_mean - self._baseline_mean)
+        return float(normalized.mean())
+
+    def score(self, features: np.ndarray, image_name: Optional[str] = None) -> dict:
         """Score a feature vector and return anomaly result."""
         if self.model is None:
             return {
@@ -173,15 +305,13 @@ class AnomalyDetector:
         features_2d = features.reshape(1, -1)
         features_2d = np.nan_to_num(features_2d, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Isolation Forest: decision_function returns negative for anomalies
         raw_score = -self.model.decision_function(features_2d)[0]
-        # Normalize to [0, 1] range
         anomaly_score = max(0.0, min(1.0, (raw_score + 0.5)))
 
         is_anomalous = anomaly_score > THRESHOLD_LOW
         severity = self._classify_severity(anomaly_score)
 
-        contributing = self._identify_contributing_features(features)
+        contributing = self._identify_contributing_features(features, image_name=image_name)
 
         return {
             "anomaly_score": round(anomaly_score, 6),
@@ -203,18 +333,31 @@ class AnomalyDetector:
             return "LOW"
         return "NONE"
 
-    def _identify_contributing_features(self, features: np.ndarray, top_k: int = 5) -> list:
-        """Identify top-k features contributing to the anomaly score."""
+    def _identify_contributing_features(self, features: np.ndarray,
+                                          image_name: Optional[str] = None,
+                                          top_k: int = 5) -> list:
+        """P2.2: Identify top-k features by z-score deviation from baseline."""
         if len(features) != len(FEATURE_NAMES):
             return []
 
-        # Use feature magnitude as a heuristic for contribution
-        feature_impacts = []
-        for i, (name, val) in enumerate(zip(FEATURE_NAMES, features)):
-            feature_impacts.append((name, abs(val)))
+        # Prefer per-image baseline, fall back to global baseline, then raw magnitude
+        mean = None
+        std = None
+        if image_name and image_name in self._image_baselines:
+            b = self._image_baselines[image_name]
+            mean = b["mean"]
+            std = self._get_image_std(image_name)
+        if mean is None and self._baseline_mean is not None:
+            mean = self._baseline_mean
+            std = self._baseline_std
 
-        feature_impacts.sort(key=lambda x: x[1], reverse=True)
-        return [name for name, _ in feature_impacts[:top_k]]
+        if mean is not None and std is not None:
+            deviations = np.abs(features - mean) / std
+        else:
+            deviations = np.abs(features)
+
+        indexed = sorted(enumerate(deviations), key=lambda x: x[1], reverse=True)
+        return [FEATURE_NAMES[i] for i, _ in indexed[:top_k]]
 
 
 # ============================================================================
@@ -298,12 +441,16 @@ class MLPipeline:
             return
 
         features_array = np.array(features, dtype=np.float64)
+        image_name = vector_data.get("image_name")
+
+        # P2.3: update per-image baseline
+        self.detector.update_image_baseline(image_name or "", features_array)
 
         # Add to training buffer
         self.detector.add_training_sample(features_array)
 
-        # Score
-        result = self.detector.score(features_array)
+        # Score with per-image context for z-score explanations
+        result = self.detector.score(features_array, image_name=image_name)
 
         elapsed = _time.monotonic() - start
         SCORING_LATENCY.observe(elapsed)
@@ -377,20 +524,15 @@ class RetrainScheduler:
         self.running = False
 
     def _run(self):
-        # Initial training after collecting enough data
-        initial_wait = 60  # Wait 60 seconds before first training attempt
+        initial_wait = 60
         time.sleep(initial_wait)
 
         while self.running:
             try:
-                logger.info("Starting scheduled model retraining...")
-                success = self.detector.train()
-                if success:
-                    logger.info("Model retrained successfully", version=self.detector.model_version)
-                else:
-                    logger.info("Retraining skipped (insufficient data)")
+                logger.info("Submitting async model retrain...")
+                self.detector.train_async()
             except Exception as e:
-                logger.error("Retraining failed", error=str(e))
+                logger.error("Retrain submission failed", error=str(e))
 
             time.sleep(self.interval_seconds)
 
@@ -421,9 +563,11 @@ def metrics():
 
 @app.route("/model/info")
 def model_info():
+    current_meta = detector._model_registry.get(detector.model_version, {})
     return jsonify({
         "model_version": detector.model_version,
         "model_type": "IsolationForest",
+        "schema_version": SCHEMA_VERSION,
         "contamination": CONTAMINATION,
         "n_estimators": detector.n_estimators,
         "feature_names": FEATURE_NAMES,
@@ -436,16 +580,34 @@ def model_info():
             "high": THRESHOLD_HIGH,
             "critical": THRESHOLD_CRITICAL,
         },
+        "lineage": current_meta,
+        "drift_score": current_meta.get("drift_score"),
+        "registry_size": len(detector._model_registry),
+        "image_baselines_tracked": len(detector._image_baselines),
+    })
+
+
+@app.route("/model/registry")
+def model_registry():
+    return jsonify({
+        "registry": detector._model_registry,
+        "current_version": detector.model_version,
+        "total": len(detector._model_registry),
     })
 
 
 @app.route("/model/retrain", methods=["POST"])
 def trigger_retrain():
-    """Manually trigger model retraining."""
-    success = detector.train()
-    if success:
-        return jsonify({"status": "success", "model_version": detector.model_version})
-    return jsonify({"status": "failed", "reason": "insufficient training data"}), 400
+    """Manually trigger async model retraining."""
+    blocking = request.args.get("blocking", "false").lower() == "true"
+    if blocking:
+        success = detector.train()
+        if success:
+            return jsonify({"status": "success", "model_version": detector.model_version})
+        return jsonify({"status": "failed", "reason": "insufficient training data"}), 400
+    else:
+        detector.train_async()
+        return jsonify({"status": "submitted", "message": "retrain queued in background"})
 
 
 @app.route("/score", methods=["POST"])
@@ -457,7 +619,8 @@ def score_vector():
         return jsonify({"error": "missing 'features' field"}), 400
 
     features_array = np.array(features, dtype=np.float64)
-    result = detector.score(features_array)
+    image_name = data.get("image_name")
+    result = detector.score(features_array, image_name=image_name)
     return jsonify(result)
 
 

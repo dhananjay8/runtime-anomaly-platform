@@ -44,6 +44,7 @@ public class AnomalyRepository {
 
     public PagedResponse<AnomalyResponse> findAnomalies(int page, int size, String severity,
                                                           String containerId, Instant from, Instant to) {
+        int cappedSize = Math.min(size, 200);
         StringBuilder countSql = new StringBuilder("SELECT COUNT(*) FROM anomaly_results WHERE detected_at BETWEEN ? AND ?");
         StringBuilder querySql = new StringBuilder(
                 "SELECT * FROM (SELECT a.*, ROWNUM rnum FROM (SELECT * FROM anomaly_results WHERE detected_at BETWEEN ? AND ?");
@@ -68,19 +69,19 @@ public class AnomalyRepository {
 
         querySql.append(" ORDER BY detected_at DESC) a WHERE ROWNUM <= ?) WHERE rnum > ?");
         List<Object> queryParams = new ArrayList<>(params);
-        int endRow = (page + 1) * size;
-        int startRow = page * size;
+        int endRow = (page + 1) * cappedSize;
+        int startRow = page * cappedSize;
         queryParams.add(endRow);
         queryParams.add(startRow);
 
         List<AnomalyResponse> content = jdbcTemplate.query(querySql.toString(), ANOMALY_ROW_MAPPER, queryParams.toArray());
 
-        int totalPages = (int) Math.ceil((double) totalElements / size);
+        int totalPages = (int) Math.ceil((double) totalElements / cappedSize);
 
         return PagedResponse.<AnomalyResponse>builder()
                 .content(content)
                 .page(page)
-                .size(size)
+                .size(cappedSize)
                 .totalElements(totalElements)
                 .totalPages(totalPages)
                 .hasNext(page < totalPages - 1)
@@ -130,6 +131,48 @@ public class AnomalyRepository {
         stats.put("generated_at", Instant.now().toString());
 
         return stats;
+    }
+
+    public List<Map<String, Object>> getAnomalyTrend(Instant from, Instant to, int bucketMinutes) {
+        String sql = """
+                SELECT TRUNC(detected_at, 'MI') - MOD(EXTRACT(MINUTE FROM detected_at), ?) * INTERVAL '1' MINUTE AS bucket,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN is_anomalous = 1 THEN 1 ELSE 0 END) AS anomalies,
+                       AVG(anomaly_score) AS avg_score
+                FROM anomaly_results
+                WHERE detected_at BETWEEN ? AND ?
+                GROUP BY TRUNC(detected_at, 'MI') - MOD(EXTRACT(MINUTE FROM detected_at), ?) * INTERVAL '1' MINUTE
+                ORDER BY bucket ASC
+                """;
+        return jdbcTemplate.queryForList(sql, bucketMinutes, Timestamp.from(from), Timestamp.from(to), bucketMinutes);
+    }
+
+    public List<Map<String, Object>> getSeverityOverTime(Instant from, Instant to, int bucketMinutes) {
+        String sql = """
+                SELECT TRUNC(detected_at, 'MI') - MOD(EXTRACT(MINUTE FROM detected_at), ?) * INTERVAL '1' MINUTE AS bucket,
+                       severity,
+                       COUNT(*) AS count
+                FROM anomaly_results
+                WHERE detected_at BETWEEN ? AND ? AND is_anomalous = 1
+                GROUP BY TRUNC(detected_at, 'MI') - MOD(EXTRACT(MINUTE FROM detected_at), ?) * INTERVAL '1' MINUTE, severity
+                ORDER BY bucket ASC, severity
+                """;
+        return jdbcTemplate.queryForList(sql, bucketMinutes, Timestamp.from(from), Timestamp.from(to), bucketMinutes);
+    }
+
+    public List<Map<String, Object>> getTopRiskyContainers(Instant since, int limit) {
+        int cappedLimit = Math.min(limit, 50);
+        String sql = """
+                SELECT container_id, COUNT(*) AS anomaly_count,
+                       MAX(anomaly_score) AS max_score, AVG(anomaly_score) AS avg_score,
+                       MAX(severity) AS worst_severity
+                FROM anomaly_results
+                WHERE is_anomalous = 1 AND detected_at > ?
+                GROUP BY container_id
+                ORDER BY anomaly_count DESC, max_score DESC
+                FETCH FIRST ? ROWS ONLY
+                """;
+        return jdbcTemplate.queryForList(sql, Timestamp.from(since), cappedLimit);
     }
 
     public void insertAnomalyResult(String resultId, String vectorId, String containerId,

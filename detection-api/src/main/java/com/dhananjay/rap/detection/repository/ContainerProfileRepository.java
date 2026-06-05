@@ -46,6 +46,7 @@ public class ContainerProfileRepository {
     };
 
     public PagedResponse<ContainerProfile> findContainers(int page, int size, String riskLevel) {
+        int cappedSize = Math.min(size, 200);
         StringBuilder countSql = new StringBuilder("SELECT COUNT(*) FROM container_profiles WHERE 1=1");
         StringBuilder querySql = new StringBuilder(
                 "SELECT * FROM (SELECT cp.*, ROWNUM rnum FROM (SELECT * FROM container_profiles WHERE 1=1");
@@ -63,17 +64,17 @@ public class ContainerProfileRepository {
 
         querySql.append(" ORDER BY last_seen DESC) cp WHERE ROWNUM <= ?) WHERE rnum > ?");
         List<Object> queryParams = new ArrayList<>(params);
-        queryParams.add((page + 1) * size);
-        queryParams.add(page * size);
+        queryParams.add((page + 1) * cappedSize);
+        queryParams.add(page * cappedSize);
 
         List<ContainerProfile> content = jdbcTemplate.query(querySql.toString(), PROFILE_ROW_MAPPER, queryParams.toArray());
 
-        int totalPages = (int) Math.ceil((double) totalElements / size);
+        int totalPages = (int) Math.ceil((double) totalElements / cappedSize);
 
         return PagedResponse.<ContainerProfile>builder()
                 .content(content)
                 .page(page)
-                .size(size)
+                .size(cappedSize)
                 .totalElements(totalElements)
                 .totalPages(totalPages)
                 .hasNext(page < totalPages - 1)

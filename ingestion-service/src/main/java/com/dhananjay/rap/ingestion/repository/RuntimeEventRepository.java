@@ -15,8 +15,11 @@ public class RuntimeEventRepository {
 
     private final JdbcTemplate jdbcTemplate;
 
-    private static final String INSERT_RUNTIME_EVENT = """
-            INSERT INTO runtime_events (
+    private static final String UPSERT_RUNTIME_EVENT = """
+            MERGE INTO runtime_events re
+            USING (SELECT ? AS event_id FROM DUAL) src
+            ON (re.event_id = src.event_id)
+            WHEN NOT MATCHED THEN INSERT (
                 event_id, event_timestamp, container_id, pid, ppid,
                 syscall, syscall_id, process_name, args, return_value,
                 destination_ip, source_ip, port, protocol, uid,
@@ -25,7 +28,9 @@ public class RuntimeEventRepository {
             """;
 
     public void insertRuntimeEvent(RuntimeEvent event) {
-        jdbcTemplate.update(INSERT_RUNTIME_EVENT,
+        jdbcTemplate.update(UPSERT_RUNTIME_EVENT,
+                event.getEventId(),
+                // INSERT values
                 event.getEventId(),
                 Timestamp.from(event.getTimestamp()),
                 event.getContainerId(),
